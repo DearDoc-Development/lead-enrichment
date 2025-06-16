@@ -1,0 +1,168 @@
+name: Deploy Lead Enrichment to ECS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: lead-enrichment
+  ECS_CLUSTER: lead-enrichment-cluster
+  ECS_TASK_DEFINITION: lead-enrichment-worker-minimal
+
+jobs:
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Build a docker container and push it to ECR
+        docker build --platform linux/amd64 -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        
+        # Tag as latest
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Register new task definition
+      id: task-def
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Create new task definition revision
+        NEW_REVISION=$(aws ecs register-task-definition \
+          --family $ECS_TASK_DEFINITION \
+          --network-mode awsvpc \
+          --requires-compatibilities FARGATE \
+          --cpu 2048 \
+          --memory 4096 \
+          --task-role-arn arn:aws:iam::238621222840:role/lead-enrichment-task-role \
+          --execution-role-arn arn:aws:iam::238621222840:role/lead-enrichment-execution-role \
+          --container-definitions '[
+            {
+              "name": "worker",
+              "image": "'$ECR_REGISTRY'/'$ECR_REPOSITORY':'$IMAGE_TAG'",
+              "essential": true,
+              "environment": [
+                {"name": "JOB_QUEUE_URL", "value": "https://sqs.us-east-1.amazonaws.com/238621222840/lead-enrichment-job-queue"},
+                {"name": "RESULTS_TABLE", "value": "lead-enrichment-results"},
+                {"name": "CACHE_TABLE", "value": "lead-enrichment-cache"},
+                {"name": "JOBS_TABLE", "value": "lead-enrichment-jobs"}
+              ],
+              "secrets": [
+                {"name": "SF_USERNAME", "valueFrom": "arn:aws:secretsmanager:us-east-1:238621222840:secret:lead-enrichment/salesforce:username::"},
+                {"name": "SF_PASSWORD", "valueFrom": "arn:aws:secretsmanager:us-east-1:238621222840:secret:lead-enrichment/salesforce:password::"},
+                {"name": "SF_SECURITY_TOKEN", "valueFrom": "arn:aws:secretsmanager:us-east-1:238621222840:secret:lead-enrichment/salesforce:token::"},
+                {"name": "OPENAI_API_KEY", "valueFrom": "arn:aws:secretsmanager:us-east-1:238621222840:secret:lead-enrichment/openai:key::"}
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/lead-enrichment-worker",
+                  "awslogs-region": "us-east-1",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }
+          ]' \
+          --region $AWS_REGION \
+          --query 'taskDefinition.revision' \
+          --output text)
+        
+        echo "revision=$NEW_REVISION" >> $GITHUB_OUTPUT
+        echo "Created task definition revision: $NEW_REVISION"
+
+    - name: Update orchestrator to use new task definition
+      env:
+        NEW_REVISION: ${{ steps.task-def.outputs.revision }}
+      run: |
+        # Update the orchestrator Lambda environment to use the new revision
+        aws lambda update-function-configuration \
+          --function-name lead-enrichment-orchestrator \
+          --environment "Variables={
+            RESULTS_TABLE=lead-enrichment-results,
+            CACHE_TABLE=lead-enrichment-cache,
+            JOBS_TABLE=lead-enrichment-jobs,
+            JOB_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/238621222840/lead-enrichment-job-queue,
+            ECS_CLUSTER=lead-enrichment-cluster,
+            ECS_TASK_DEFINITION=lead-enrichment-worker-minimal:$NEW_REVISION,
+            ECS_SUBNETS=subnet-0d2477f1e24852c0a,
+            ECS_SECURITY_GROUP=sg-18361d5e,
+            SF_USERNAME=${{ secrets.SF_USERNAME }},
+            SF_PASSWORD=${{ secrets.SF_PASSWORD }},
+            SF_SECURITY_TOKEN=${{ secrets.SF_SECURITY_TOKEN }},
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          }" \
+          --region $AWS_REGION
+
+    - name: Test deployment
+      env:
+        NEW_REVISION: ${{ steps.task-def.outputs.revision }}
+      run: |
+        echo "Testing new deployment with task definition revision: $NEW_REVISION"
+        
+        # Run a test task
+        TASK_ARN=$(aws ecs run-task \
+          --cluster $ECS_CLUSTER \
+          --task-definition $ECS_TASK_DEFINITION:$NEW_REVISION \
+          --count 1 \
+          --launch-type FARGATE \
+          --network-configuration "awsvpcConfiguration={subnets=[subnet-0d2477f1e24852c0a],securityGroups=[sg-18361d5e],assignPublicIp=ENABLED}" \
+          --region $AWS_REGION \
+          --query 'tasks[0].taskArn' \
+          --output text)
+        
+        echo "Started test task: $TASK_ARN"
+        
+        # Wait for task to start
+        sleep 30
+        
+        # Check task status
+        TASK_STATUS=$(aws ecs describe-tasks \
+          --cluster $ECS_CLUSTER \
+          --tasks $TASK_ARN \
+          --region $AWS_REGION \
+          --query 'tasks[0].lastStatus' \
+          --output text)
+        
+        echo "Task status: $TASK_STATUS"
+        
+        if [ "$TASK_STATUS" = "RUNNING" ]; then
+          echo "✅ Deployment test successful!"
+          # Stop the test task
+          aws ecs stop-task --cluster $ECS_CLUSTER --task $TASK_ARN --region $AWS_REGION
+        else
+          echo "❌ Deployment test failed!"
+          exit 1
+        fi
+
+    - name: Deployment summary
+      run: |
+        echo "🚀 Deployment completed successfully!"
+        echo "📦 Image: ${{ steps.build-image.outputs.image }}"
+        echo "📋 Task Definition: $ECS_TASK_DEFINITION:${{ steps.task-def.outputs.revision }}"
+        echo "🔄 Orchestrator updated to use new revision"

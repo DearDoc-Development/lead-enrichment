@@ -1,0 +1,19 @@
+# Core dependencies
+boto3==1.28.62
+simple-salesforce==1.12.5
+
+# AI providers
+openai==0.28.1
+
+# Web scraping (for Lambda layer)
+playwright==1.39.0
+beautifulsoup4==4.12.2
+
+# Data processing
+pydantic==2.4.2
+
+# Development
+pytest==7.4.3
+black==23.10.1
+mypy==1.6.1
+boto3-stubs[dynamodb,sqs,s3]==1.28.62

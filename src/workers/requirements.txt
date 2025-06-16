@@ -1,0 +1,6 @@
+boto3
+simple-salesforce
+openai==0.28.1
+anthropic==0.7.1
+beautifulsoup4
+requests

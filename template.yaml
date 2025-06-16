@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Lead Enrichment Serverless Application
+
+Globals:
+  Function:
+    Timeout: 300  # 5 minutes
+    MemorySize: 1024  # 1GB for Playwright
+    Runtime: python3.9
+    Environment:
+      Variables:
+        SF_USERNAME: !Ref SalesforceUsername
+        SF_PASSWORD: !Ref SalesforcePassword
+        SF_SECURITY_TOKEN: !Ref SalesforceSecurityToken
+        OPENAI_API_KEY: !Ref OpenAIApiKey
+        ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+
+Parameters:
+  SalesforceUsername:
+    Type: String
+    Description: Salesforce username
+    NoEcho: true
+  
+  SalesforcePassword:
+    Type: String
+    Description: Salesforce password
+    NoEcho: true
+  
+  SalesforceSecurityToken:
+    Type: String
+    Description: Salesforce security token
+    NoEcho: true
+  
+  OpenAIApiKey:
+    Type: String
+    Description: OpenAI API key
+    NoEcho: true
+    Default: ""
+  
+  AnthropicApiKey:
+    Type: String
+    Description: Anthropic API key
+    NoEcho: true
+    Default: ""
+
+Resources:
+  # DynamoDB Tables
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-jobs
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-results
+      AttributeDefinitions:
+        - AttributeName: lead_id
+          AttributeType: S
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: lead_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: job_id-index
+          KeySchema:
+            - AttributeName: job_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+
+  CacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-cache
+      AttributeDefinitions:
+        - AttributeName: website
+          AttributeType: S
+      KeySchema:
+        - AttributeName: website
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # SQS Queues
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-job-queue
+      VisibilityTimeout: 300  # 5 minutes
+      MessageRetentionPeriod: 86400  # 24 hours
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobDLQ.Arn
+        maxReceiveCount: 3
+
+  JobDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-job-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # Lambda Functions
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-orchestrator
+      CodeUri: src/orchestrator/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          JOB_QUEUE_URL: !Ref JobQueue
+          JOBS_TABLE: !Ref JobsTable
+          RESULTS_TABLE: !Ref ResultsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResultsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt JobQueue.QueueName
+      Events:
+        ScheduledEvent:
+          Type: Schedule
+          Properties:
+            Schedule: rate(6 hours)  # Run every 6 hours
+            Description: "Automatic lead enrichment every 6 hours"
+            Enabled: true
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-worker
+      CodeUri: src/workers/
+      Handler: enrichment_worker.lambda_handler
+      MemorySize: 2048  # 2GB for Playwright
+      Timeout: 300
+      ReservedConcurrentExecutions: 100  # Limit concurrent executions to control costs
+      # Layers:
+      #   - !Ref PlaywrightLayer  # Temporarily disabled - too large
+      Environment:
+        Variables:
+          RESULTS_TABLE: !Ref ResultsTable
+          CACHE_TABLE: !Ref CacheTable
+          JOBS_TABLE: !Ref JobsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResultsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CacheTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt JobQueue.Arn
+            BatchSize: 1  # Each worker processes 1 lead at a time
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  # Lambda Layer for Playwright
+  PlaywrightLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub ${AWS::StackName}-playwright
+      Description: Playwright and Chromium for Lambda
+      ContentUri: layers/playwright/
+      CompatibleRuntimes:
+        - python3.9
+      RetentionPolicy: Delete
+
+  # Manual Trigger Function (optional for manual runs)
+  ManualTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-manual-trigger
+      CodeUri: src/orchestrator/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          JOB_QUEUE_URL: !Ref JobQueue
+          JOBS_TABLE: !Ref JobsTable
+          RESULTS_TABLE: !Ref ResultsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResultsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt JobQueue.QueueName
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /trigger
+            Method: POST
+
+  # CloudWatch Dashboard
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-monitoring
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", {"stat": "Sum", "period": 300}],
+                  [".", "Errors", {"stat": "Sum", "period": 300}],
+                  [".", "Duration", {"stat": "Average", "period": 300}]
+                ],
+                "region": "${AWS::Region}",
+                "title": "Lambda Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/SQS", "NumberOfMessagesSent", {"stat": "Sum", "period": 300}],
+                  [".", "NumberOfMessagesReceived", {"stat": "Sum", "period": 300}]
+                ],
+                "region": "${AWS::Region}",
+                "title": "SQS Metrics"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  OrchestratorFunction:
+    Description: Orchestrator Lambda function (scheduled every 6 hours)
+    Value: !Ref OrchestratorFunction
+  
+  ManualTriggerEndpoint:
+    Description: API Gateway endpoint for manual triggers
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/trigger
+  
+  JobsTable:
+    Description: DynamoDB table for jobs
+    Value: !Ref JobsTable
+  
+  ResultsTable:
+    Description: DynamoDB table for results
+    Value: !Ref ResultsTable
+  
+  ScheduleStatus:
+    Description: Automatic enrichment schedule
+    Value: "Every 6 hours (rate(6 hours))"
