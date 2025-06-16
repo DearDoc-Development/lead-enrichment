@@ -1,0 +1,678 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Complete Lead Enrichment System - ECS with Full Playwright Support
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for ECS tasks
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for ECS tasks
+
+Resources:
+  # DynamoDB Tables
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: lead-enrichment-jobs
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: lead-enrichment-results
+      AttributeDefinitions:
+        - AttributeName: lead_id
+          AttributeType: S
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: lead_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: job_id-index
+          KeySchema:
+            - AttributeName: job_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+
+  CacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: lead-enrichment-cache
+      AttributeDefinitions:
+        - AttributeName: website
+          AttributeType: S
+      KeySchema:
+        - AttributeName: website
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # SQS Queues
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: lead-enrichment-job-queue
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobDLQ.Arn
+        maxReceiveCount: 3
+
+  JobDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: lead-enrichment-job-dlq
+      MessageRetentionPeriod: 1209600
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: lead-enrichment-cluster
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 80
+        - CapacityProvider: FARGATE
+          Weight: 20
+
+  # IAM Roles
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lead-enrichment-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LeadEnrichmentTaskPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !GetAtt ResultsTable.Arn
+                  - !GetAtt CacheTable.Arn
+                  - !Sub "${ResultsTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt JobQueue.Arn
+                  - !GetAtt JobDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: 
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lead-enrichment/*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:lead-enrichment-orchestrator'
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lead-enrichment-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: 
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lead-enrichment/*'
+
+  # ECR Repository
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: lead-enrichment-worker
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # CloudWatch Log Groups
+  OrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/lead-enrichment-orchestrator
+      RetentionInDays: 7
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/lead-enrichment-worker
+      RetentionInDays: 7
+
+  # Security Group
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # Lambda Orchestrator
+  OrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lead-enrichment-orchestrator
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt OrchestratorRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          JOB_QUEUE_URL: !Ref JobQueue
+          JOBS_TABLE: !Ref JobsTable
+          RESULTS_TABLE: !Ref ResultsTable
+          ECS_CLUSTER: !Ref ECSCluster
+          ECS_TASK_DEFINITION: !Ref TaskDefinition
+          ECS_SUBNETS: !Join [",", !Ref SubnetIds]
+          ECS_SECURITY_GROUP: !Ref SecurityGroup
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import boto3
+          from datetime import datetime, timedelta
+          from simple_salesforce import Salesforce
+
+          # AWS clients
+          sqs = boto3.client('sqs')
+          dynamodb = boto3.resource('dynamodb')
+          ecs = boto3.client('ecs')
+
+          # Environment variables
+          JOB_QUEUE_URL = os.environ['JOB_QUEUE_URL']
+          JOBS_TABLE = os.environ['JOBS_TABLE']
+          RESULTS_TABLE = os.environ['RESULTS_TABLE']
+          ECS_CLUSTER = os.environ['ECS_CLUSTER']
+          ECS_TASK_DEFINITION = os.environ['ECS_TASK_DEFINITION']
+          ECS_SUBNETS = os.environ['ECS_SUBNETS'].split(',')
+          ECS_SECURITY_GROUP = os.environ['ECS_SECURITY_GROUP']
+
+          jobs_table = dynamodb.Table(JOBS_TABLE)
+
+          def lambda_handler(event, context):
+              try:
+                  # Check if this is a scheduled event
+                  if event.get('source') == 'aws.events':
+                      print("Triggered by scheduled event")
+                      default_params = {
+                          'created_after': get_last_run_date(),
+                          'update_salesforce': True,
+                          'limit': 10000
+                      }
+                      return start_enrichment_job(default_params)
+                  
+                  # Handle manual invocations
+                  action = event.get('action', 'start_job')
+                  
+                  if action == 'start_job':
+                      return start_enrichment_job(event.get('parameters', {}))
+                  elif action == 'check_status':
+                      return check_job_status(event.get('job_id'))
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': f'Unknown action: {action}'})
+                      }
+              except Exception as e:
+                  print(f"Error in orchestrator: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+          def start_enrichment_job(parameters):
+              job_id = str(uuid.uuid4())
+              
+              # Create job record
+              job_record = {
+                  'job_id': job_id,
+                  'status': 'fetching_leads',
+                  'created_at': datetime.utcnow().isoformat(),
+                  'parameters': parameters,
+                  'total_leads': 0,
+                  'processed_leads': 0,
+                  'failed_leads': 0
+              }
+              
+              jobs_table.put_item(Item=job_record)
+              
+              try:
+                  # Fetch leads from Salesforce
+                  leads = fetch_salesforce_leads(parameters)
+                  total_leads = len(leads)
+                  
+                  # Update job record
+                  jobs_table.update_item(
+                      Key={'job_id': job_id},
+                      UpdateExpression='SET #status = :status, total_leads = :total',
+                      ExpressionAttributeNames={'#status': 'status'},
+                      ExpressionAttributeValues={
+                          ':status': 'queuing_leads',
+                          ':total': total_leads
+                      }
+                  )
+                  
+                  # Send leads to SQS queue
+                  for lead in leads:
+                      sqs.send_message(
+                          QueueUrl=JOB_QUEUE_URL,
+                          MessageBody=json.dumps({
+                              'job_id': job_id,
+                              'lead': lead,
+                              'parameters': parameters
+                          })
+                      )
+                  
+                  # Start ECS workers only if there are leads to process
+                  if leads:
+                      print(f"Starting ECS workers for {len(leads)} leads")
+                      start_ecs_workers(len(leads))
+                  else:
+                      print("No leads found matching criteria - skipping ECS worker startup")
+                      jobs_table.update_item(
+                          Key={'job_id': job_id},
+                          UpdateExpression='SET #status = :status',
+                          ExpressionAttributeNames={'#status': 'status'},
+                          ExpressionAttributeValues={':status': 'completed_no_leads'}
+                      )
+                  
+                  # Update job status
+                  jobs_table.update_item(
+                      Key={'job_id': job_id},
+                      UpdateExpression='SET #status = :status',
+                      ExpressionAttributeNames={'#status': 'status'},
+                      ExpressionAttributeValues={':status': 'processing'}
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'job_id': job_id,
+                          'status': 'processing',
+                          'total_leads': total_leads,
+                          'message': f'Job started successfully. Processing {total_leads} leads.'
+                      })
+                  }
+                  
+              except Exception as e:
+                  jobs_table.update_item(
+                      Key={'job_id': job_id},
+                      UpdateExpression='SET #status = :status, error = :error',
+                      ExpressionAttributeNames={'#status': 'status'},
+                      ExpressionAttributeValues={
+                          ':status': 'failed',
+                          ':error': str(e)
+                      }
+                  )
+                  raise
+
+          def fetch_salesforce_leads(parameters):
+              # Get credentials from Secrets Manager
+              secrets_client = boto3.client('secretsmanager')
+              
+              sf_secret = secrets_client.get_secret_value(
+                  SecretId='lead-enrichment/salesforce'
+              )
+              sf_creds = json.loads(sf_secret['SecretString'])
+              
+              sf = Salesforce(
+                  username=sf_creds['username'],
+                  password=sf_creds['password'],
+                  security_token=sf_creds['token']
+              )
+              
+              query = """
+                  SELECT Id, Name, Company, Website, Email, Phone,
+                         Street, City, State, PostalCode, Country,
+                         FirstName, LastName, Title, CreatedDate
+                  FROM Lead
+                  WHERE Website != null
+                  AND (Enrichment_Completed__c = false OR Enrichment_Completed__c = null)
+                  AND (CreatedById = '0054V00000GJFtbQAH' 
+                       OR (FirstName = 'Info' AND LastName = 'Needed'))
+              """
+              
+              if parameters.get('created_after'):
+                  query += f" AND CreatedDate >= {parameters['created_after']}T00:00:00Z"
+              
+              query += " ORDER BY CreatedDate DESC"
+              
+              if parameters.get('limit'):
+                  query += f" LIMIT {parameters['limit']}"
+              
+              results = sf.query_all(query)
+              
+              leads = []
+              for record in results['records']:
+                  lead = {
+                      'id': record['Id'],
+                      'name': record.get('Name'),
+                      'company': record.get('Company'),
+                      'website': record.get('Website'),
+                      'email': record.get('Email'),
+                      'phone': record.get('Phone'),
+                      'address': {
+                          'street': record.get('Street'),
+                          'city': record.get('City'),
+                          'state': record.get('State'),
+                          'postal_code': record.get('PostalCode'),
+                          'country': record.get('Country')
+                      },
+                      'first_name': record.get('FirstName'),
+                      'last_name': record.get('LastName'),
+                      'title': record.get('Title'),
+                      'created_date': record.get('CreatedDate')
+                  }
+                  leads.append(lead)
+              
+              return leads
+
+          def start_ecs_workers(num_leads):
+              # Calculate desired task count (1 task per 10 leads, max 100 tasks)
+              desired_tasks = min(max(1, num_leads // 10), 100)
+              
+              try:
+                  ecs.run_task(
+                      cluster=ECS_CLUSTER,
+                      taskDefinition=ECS_TASK_DEFINITION,
+                      count=desired_tasks,
+                      launchType='FARGATE',
+                      networkConfiguration={
+                          'awsvpcConfiguration': {
+                              'subnets': ECS_SUBNETS,
+                              'securityGroups': [ECS_SECURITY_GROUP],
+                              'assignPublicIp': 'ENABLED'
+                          }
+                      }
+                  )
+                  print(f"Started {desired_tasks} ECS tasks for {num_leads} leads")
+              except Exception as e:
+                  print(f"Error starting ECS tasks: {str(e)}")
+
+          def get_last_run_date():
+              try:
+                  response = jobs_table.scan(
+                      FilterExpression='#status = :status',
+                      ExpressionAttributeNames={'#status': 'status'},
+                      ExpressionAttributeValues={':status': 'completed'},
+                      ProjectionExpression='created_at'
+                  )
+                  
+                  if response['Items']:
+                      last_run = max(response['Items'], key=lambda x: x['created_at'])
+                      return last_run['created_at'][:10]
+                  else:
+                      week_ago = datetime.utcnow() - timedelta(days=7)
+                      return week_ago.strftime('%Y-%m-%d')
+              except Exception as e:
+                  print(f"Error getting last run date: {str(e)}")
+                  yesterday = datetime.utcnow() - timedelta(days=1)
+                  return yesterday.strftime('%Y-%m-%d')
+
+          def check_job_status(job_id):
+              try:
+                  response = jobs_table.get_item(Key={'job_id': job_id})
+                  
+                  if 'Item' not in response:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'Job not found'})
+                      }
+                  
+                  job = response['Item']
+                  
+                  results_table_obj = dynamodb.Table(RESULTS_TABLE)
+                  results = results_table_obj.query(
+                      IndexName='job_id-index',
+                      KeyConditionExpression='job_id = :job_id',
+                      ExpressionAttributeValues={':job_id': job_id},
+                      Select='COUNT'
+                  )
+                  
+                  processed_count = results.get('Count', 0)
+                  total_leads = job.get('total_leads', 0)
+                  progress = (processed_count / total_leads * 100) if total_leads > 0 else 0
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'job_id': job_id,
+                          'status': job['status'],
+                          'total_leads': total_leads,
+                          'processed_leads': processed_count,
+                          'progress_percentage': round(progress, 2),
+                          'created_at': job.get('created_at'),
+                          'parameters': job.get('parameters', {})
+                      })
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  OrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrchestratorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !GetAtt ResultsTable.Arn
+                  - !Sub "${ResultsTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt JobQueue.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: 
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lead-enrichment/*'
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: 
+                  - !GetAtt TaskRole.Arn
+                  - !GetAtt ExecutionRole.Arn
+
+  # CloudWatch Event Rule for Scheduling
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger lead enrichment every 6 hours"
+      ScheduleExpression: "rate(6 hours)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrchestratorFunction.Arn
+          Id: "OrchestratorTarget"
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  # ECS Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: lead-enrichment-worker
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '2048'
+      Memory: '4096'
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/lead-enrichment-worker:latest'
+          Essential: true
+          Environment:
+            - Name: JOB_QUEUE_URL
+              Value: !Ref JobQueue
+            - Name: RESULTS_TABLE
+              Value: !Ref ResultsTable
+            - Name: CACHE_TABLE
+              Value: !Ref CacheTable
+            - Name: JOBS_TABLE
+              Value: !Ref JobsTable
+          Secrets:
+            - Name: SF_USERNAME
+              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lead-enrichment/salesforce:username::'
+            - Name: SF_PASSWORD
+              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lead-enrichment/salesforce:password::'
+            - Name: SF_SECURITY_TOKEN
+              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lead-enrichment/salesforce:token::'
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lead-enrichment/openai:key::'
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lead-enrichment/anthropic:key::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # API Gateway for Manual Triggers
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: lead-enrichment-api
+      Description: API for manual lead enrichment triggers
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: trigger
+
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Arn}/invocations'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: 
+      - ApiMethod
+      - ApiPermission
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: prod
+
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${RestApi}/*/*'
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint for manual triggers
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/trigger'
+  
+  ECSCluster:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+  
+  ECRRepository:
+    Description: ECR Repository URI
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+  
+  JobsTable:
+    Description: DynamoDB Jobs Table
+    Value: !Ref JobsTable
+  
+  ResultsTable:
+    Description: DynamoDB Results Table
+    Value: !Ref ResultsTable
