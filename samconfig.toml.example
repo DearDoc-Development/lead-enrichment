@@ -1,0 +1,20 @@
+version = 0.1
+
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "lead-enrichment-serverless"
+s3_prefix = "lead-enrichment-serverless"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = [
+    "SalesforceUsername='YOUR_SALESFORCE_USERNAME'",
+    "SalesforcePassword='YOUR_SALESFORCE_PASSWORD'", 
+    "SalesforceSecurityToken='YOUR_SALESFORCE_SECURITY_TOKEN'",
+    "OpenAIApiKey='YOUR_OPENAI_API_KEY'",
+    "AnthropicApiKey='YOUR_ANTHROPIC_API_KEY'"
+]
+resolve_s3 = true
+confirm_changeset = true
+disable_rollback = true
+image_repositories = []

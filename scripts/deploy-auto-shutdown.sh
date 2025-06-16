@@ -17,10 +17,12 @@ TASK_FAMILY="lead-enrichment-worker-minimal"
 # Auto-shutdown settings (can be overridden)
 AUTO_SHUTDOWN_ENABLED=${AUTO_SHUTDOWN_ENABLED:-"true"}
 IDLE_TIMEOUT_MINUTES=${IDLE_TIMEOUT_MINUTES:-"5"}
+LOG_LEVEL=${LOG_LEVEL:-"INFO"}
 
 echo "Configuration:"
 echo "- Auto-shutdown enabled: $AUTO_SHUTDOWN_ENABLED"
 echo "- Idle timeout: $IDLE_TIMEOUT_MINUTES minutes"
+echo "- Log level: $LOG_LEVEL"
 echo ""
 
 # Build new Docker image
@@ -55,7 +57,8 @@ CURRENT_TASK_DEF=$(aws ecs describe-task-definition \
 # Create new task definition with updated image and environment
 NEW_TASK_DEF=$(echo $CURRENT_TASK_DEF | jq --arg image "$ECR_REPO:$IMAGE_TAG" \
     --arg auto_shutdown "$AUTO_SHUTDOWN_ENABLED" \
-    --arg idle_timeout "$IDLE_TIMEOUT_MINUTES" '
+    --arg idle_timeout "$IDLE_TIMEOUT_MINUTES" \
+    --arg log_level "$LOG_LEVEL" '
     del(.taskDefinitionArn) |
     del(.revision) |
     del(.status) |
@@ -67,7 +70,8 @@ NEW_TASK_DEF=$(echo $CURRENT_TASK_DEF | jq --arg image "$ECR_REPO:$IMAGE_TAG" \
     .containerDefinitions[0].image = $image |
     .containerDefinitions[0].environment += [
         {"name": "AUTO_SHUTDOWN_ENABLED", "value": $auto_shutdown},
-        {"name": "IDLE_TIMEOUT_MINUTES", "value": $idle_timeout}
+        {"name": "IDLE_TIMEOUT_MINUTES", "value": $idle_timeout},
+        {"name": "LOG_LEVEL", "value": $log_level}
     ]')
 
 # Register new task definition

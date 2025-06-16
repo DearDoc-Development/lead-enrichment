@@ -10,6 +10,7 @@ Processes individual leads:
 import json
 import os
 import asyncio
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Any, Optional
@@ -17,6 +18,11 @@ import boto3
 from playwright.async_api import async_playwright
 import openai
 from simple_salesforce import Salesforce
+
+# Configure logging based on environment variable
+log_level = os.environ.get('LOG_LEVEL', 'INFO')
+logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def convert_floats_to_decimal(obj):
     """Recursively convert float values to Decimal for DynamoDB compatibility."""
@@ -73,7 +79,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 records_failed += 1
                 
         except Exception as e:
-            print(f"Error processing record: {str(e)}")
+            logger.error(f"Error processing record: {str(e)}")
             records_failed += 1
     
     return {
@@ -98,7 +104,7 @@ async def process_lead(job_id: str, lead: Dict[str, Any], parameters: Dict[str, 
         cached_content = check_cache(website)
         
         if cached_content:
-            print(f"Using cached content for {website}")
+            logger.debug(f"Using cached content for {website}")
             scraped_data = cached_content
         else:
             # Scrape website
@@ -136,7 +142,7 @@ async def process_lead(job_id: str, lead: Dict[str, Any], parameters: Dict[str, 
                 await update_salesforce_lead(lead_id, extracted_info)
                 enriched_lead['salesforce_updated'] = True
             except Exception as e:
-                print(f"Failed to update Salesforce for lead {lead_id}: {str(e)}")
+                logger.error(f"Failed to update Salesforce for lead {lead_id}: {str(e)}")
                 enriched_lead['salesforce_error'] = str(e)
         
         # Update job progress
@@ -145,7 +151,7 @@ async def process_lead(job_id: str, lead: Dict[str, Any], parameters: Dict[str, 
         return enriched_lead
         
     except Exception as e:
-        print(f"Error processing lead {lead.get('id')}: {str(e)}")
+        logger.error(f"Error processing lead {lead.get('id')}: {str(e)}")
         return save_error_result(job_id, lead.get('id'), str(e))
 
 
@@ -186,7 +192,7 @@ async def scrape_website(url: str, max_retries: int = 3) -> Optional[Dict[str, A
                 timeout = 20000 + (attempt * 10000)  # 20s, 30s, 40s
                 page.set_default_timeout(timeout)
                 
-                print(f"Attempt {attempt + 1}/{max_retries} scraping {url} (timeout: {timeout}ms)")
+                logger.debug(f"Attempt {attempt + 1}/{max_retries} scraping {url} (timeout: {timeout}ms)")
                 
                 # Navigate to the website with retry-specific handling
                 await page.goto(url, wait_until='domcontentloaded', timeout=timeout)
@@ -212,7 +218,7 @@ async def scrape_website(url: str, max_retries: int = 3) -> Optional[Dict[str, A
                 
                 await browser.close()
                 
-                print(f"Successfully scraped {url} on attempt {attempt + 1}")
+                logger.info(f"Successfully scraped {url}")
                 return {
                     'url': url,
                     'main_content': text_content,
@@ -222,7 +228,7 @@ async def scrape_website(url: str, max_retries: int = 3) -> Optional[Dict[str, A
                 
         except Exception as e:
             error_msg = str(e)
-            print(f"Attempt {attempt + 1}/{max_retries} failed for {url}: {error_msg}")
+            logger.debug(f"Attempt {attempt + 1}/{max_retries} failed for {url}: {error_msg}")
             
             if browser:
                 try:
@@ -240,12 +246,12 @@ async def scrape_website(url: str, max_retries: int = 3) -> Optional[Dict[str, A
             is_retryable = any(retry_err.lower() in error_msg.lower() for retry_err in retryable_errors)
             
             if not is_retryable or attempt == max_retries - 1:
-                print(f"Failed to scrape {url} after {attempt + 1} attempts: {error_msg}")
+                logger.warning(f"Failed to scrape {url} after {attempt + 1} attempts: {error_msg}")
                 return None
             
             # Wait before retry with exponential backoff
             wait_time = 2 ** attempt  # 1s, 2s, 4s
-            print(f"Retrying in {wait_time} seconds...")
+            logger.debug(f"Retrying in {wait_time} seconds...")
             await asyncio.sleep(wait_time)
     
     return None
@@ -305,12 +311,12 @@ async def extract_information(scraped_data: Dict[str, Any], lead: Dict[str, Any]
             return result
             
         except Exception as e:
-            print(f"OpenAI failed: {str(e)}")
+            logger.error(f"OpenAI failed: {str(e)}")
             # Return None if OpenAI fails
             return None
             
     except Exception as e:
-        print(f"Error in AI extraction: {str(e)}")
+        logger.error(f"Error in AI extraction: {str(e)}")
         return None
 
 
@@ -339,7 +345,7 @@ def cache_content(website: str, content: Dict[str, Any]) -> None:
             }
         )
     except Exception as e:
-        print(f"Error caching content: {str(e)}")
+        logger.error(f"Error caching content: {str(e)}")
 
 
 def save_error_result(job_id: str, lead_id: str, error: str) -> None:
@@ -435,10 +441,10 @@ async def update_salesforce_lead(lead_id: str, extracted_info: Dict[str, Any]) -
         # Update the lead in Salesforce
         if update_data:
             sf.Lead.update(lead_id, update_data)
-            print(f"Successfully updated Salesforce lead {lead_id} with {len(update_data)} fields")
+            logger.info(f"Updated Salesforce lead {lead_id} with {len(update_data)} fields")
         
     except Exception as e:
-        print(f"Error updating Salesforce lead {lead_id}: {str(e)}")
+        logger.error(f"Error updating Salesforce lead {lead_id}: {str(e)}")
         raise
 
 
@@ -458,7 +464,7 @@ def update_job_progress(job_id: str, success: bool) -> None:
                 ExpressionAttributeValues={':inc': 1}
             )
     except Exception as e:
-        print(f"Error updating job progress: {str(e)}")
+        logger.error(f"Error updating job progress: {str(e)}")
 
 
 def main():
@@ -471,7 +477,7 @@ def main():
     
     def signal_handler(_signum, _frame):
         nonlocal shutdown
-        print("Received shutdown signal, finishing current work...")
+        logger.info("Received shutdown signal, finishing current work...")
         shutdown = True
     
     signal.signal(signal.SIGTERM, signal_handler)
@@ -490,11 +496,11 @@ def main():
     total_processed = 0
     
     if AUTO_SHUTDOWN_ENABLED:
-        print(f"Worker starting with auto-shutdown enabled (idle timeout: {IDLE_TIMEOUT_MINUTES} minutes)")
+        logger.info(f"Worker starting with auto-shutdown enabled (idle timeout: {IDLE_TIMEOUT_MINUTES} minutes)")
     else:
-        print("Worker starting with auto-shutdown disabled")
+        logger.info("Worker starting with auto-shutdown disabled")
     
-    print(f"Polling queue: {queue_url}")
+    logger.info(f"Polling queue: {queue_url}")
     
     while not shutdown:
         try:
@@ -510,12 +516,12 @@ def main():
             
             if not messages:
                 idle_poll_count += 1
-                print(f"No messages available, continuing to poll... (idle: {idle_poll_count}/{MAX_IDLE_POLLS})")
+                logger.debug(f"No messages available, idle count: {idle_poll_count}/{MAX_IDLE_POLLS}")
                 
                 # Check for auto-shutdown
                 if AUTO_SHUTDOWN_ENABLED and idle_poll_count >= MAX_IDLE_POLLS:
-                    print(f"🔄 Auto-shutdown triggered: No work for {IDLE_TIMEOUT_MINUTES} minutes")
-                    print(f"📊 Worker processed {total_processed} leads before shutting down")
+                    logger.info(f"Auto-shutdown triggered: No work for {IDLE_TIMEOUT_MINUTES} minutes")
+                    logger.info(f"Worker processed {total_processed} leads before shutting down")
                     break
                 
                 continue
@@ -529,7 +535,7 @@ def main():
                     body = json.loads(message['Body'])
                     receipt_handle = message['ReceiptHandle']
                     
-                    print(f"Processing message for lead: {body.get('lead', {}).get('id', 'Unknown')}")
+                    logger.info(f"Processing message for lead: {body.get('lead', {}).get('id', 'Unknown')}")
                     
                     # Process the lead
                     job_id = body['job_id']
@@ -540,25 +546,25 @@ def main():
                     
                     if result:
                         total_processed += 1
-                        print(f"Successfully processed lead {lead['id']} (total: {total_processed})")
+                        logger.info(f"Successfully processed lead {lead['id']}")
                         # Delete message from queue
                         sqs.delete_message(
                             QueueUrl=queue_url,
                             ReceiptHandle=receipt_handle
                         )
                     else:
-                        print(f"Failed to process lead {lead['id']}")
+                        logger.error(f"Failed to process lead {lead['id']}")
                         # Leave message in queue to be retried
                         
                 except Exception as e:
-                    print(f"Error processing message: {str(e)}")
+                    logger.error(f"Error processing message: {str(e)}")
                     # Leave message in queue to be retried
                     
         except Exception as e:
-            print(f"Error polling queue: {str(e)}")
+            logger.error(f"Error polling queue: {str(e)}")
             time.sleep(5)  # Wait before retrying
     
-    print("Worker shutting down gracefully")
+    logger.info("Worker shutting down gracefully")
 
 
 if __name__ == "__main__":

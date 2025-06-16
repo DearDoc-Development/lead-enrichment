@@ -50,3 +50,6 @@ dist/
 # Environment variables
 .env
 .env.local
+
+# Configuration with secrets
+samconfig.toml
