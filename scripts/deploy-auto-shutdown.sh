@@ -87,16 +87,7 @@ echo "✅ New task definition registered: $TASK_FAMILY:$NEW_REVISION"
 echo "🔄 Updating orchestrator to use new task definition..."
 aws lambda update-function-configuration \
     --function-name lead-enrichment-orchestrator \
-    --environment Variables="{
-        \"RESULTS_TABLE\":\"lead-enrichment-results\",
-        \"ECS_CLUSTER\":\"lead-enrichment-cluster\",
-        \"JOBS_TABLE\":\"lead-enrichment-jobs\",
-        \"ECS_TASK_DEFINITION\":\"$TASK_FAMILY:$NEW_REVISION\",
-        \"CACHE_TABLE\":\"lead-enrichment-cache\",
-        \"ECS_SUBNETS\":\"subnet-0d2477f1e24852c0a\",
-        \"JOB_QUEUE_URL\":\"https://sqs.us-east-1.amazonaws.com/238621222840/lead-enrichment-job-queue\",
-        \"ECS_SECURITY_GROUP\":\"sg-18361d5e\"
-    }" \
+    --environment "Variables={\"RESULTS_TABLE\":\"lead-enrichment-results\",\"ECS_CLUSTER\":\"lead-enrichment-cluster\",\"JOBS_TABLE\":\"lead-enrichment-jobs\",\"ECS_TASK_DEFINITION\":\"$TASK_FAMILY:$NEW_REVISION\",\"CACHE_TABLE\":\"lead-enrichment-cache\",\"ECS_SUBNETS\":\"subnet-0d2477f1e24852c0a\",\"JOB_QUEUE_URL\":\"https://sqs.us-east-1.amazonaws.com/238621222840/lead-enrichment-job-queue\",\"ECS_SECURITY_GROUP\":\"sg-18361d5e\"}" \
     --region $REGION > /dev/null
 
 echo "✅ Orchestrator updated"
